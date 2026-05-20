@@ -3,6 +3,7 @@ require("dotenv").config();
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const cheerio = require("cheerio");
 const fs = require("fs");
+const he = require("he");
 
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -91,18 +92,66 @@ function absoluteUrl(url, baseUrl) {
 
 function cleanText(text) {
   if (!text) return "";
-  return text.replace(/\s+/g, " ").trim();
+
+  return he
+    .decode(String(text))
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\r/g, "")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
-function limitText(text, maxLength = 500) {
+function cleanTitle(text) {
+  return cleanText(text)
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function limitText(text, maxLength = 900) {
   if (!text) return null;
+
   const cleaned = cleanText(text);
+  if (!cleaned) return null;
 
   if (cleaned.length <= maxLength) {
     return cleaned;
   }
 
   return cleaned.slice(0, maxLength - 3) + "...";
+}
+
+function cleanLodestoneDescription(text) {
+  if (!text) return null;
+
+  let description = cleanText(text);
+
+  description = description
+    .replace(/The Lodestone\s*\|?\s*FINAL FANTASY XIV.*$/i, "")
+    .replace(/FINAL FANTASY XIV, The Lodestone.*$/i, "")
+    .replace(/Official community site.*$/i, "")
+    .replace(/JavaScript.*$/i, "")
+    .replace(/window\..*$/i, "")
+    .replace(/var .*$/i, "")
+    .replace(/function\s*\(.*$/i, "")
+    .replace(/Please enable JavaScript.*$/i, "")
+    .trim();
+
+  if (!description || description.length < 10) {
+    return null;
+  }
+
+  return limitText(description, 500);
 }
 
 async function fetchHtml(url) {
@@ -119,52 +168,202 @@ async function fetchHtml(url) {
   return await response.text();
 }
 
-async function fetchArticleDetails(articleUrl) {
+function getArticleText($) {
+  $("script").remove();
+  $("style").remove();
+  $("noscript").remove();
+
+  const selectors = [
+    ".news__detail__wrapper",
+    ".news__detail",
+    ".topics__detail",
+    ".ldst__window__body",
+    ".ldst__window",
+    "article",
+    "main"
+  ];
+
+  for (const selector of selectors) {
+    const element = $(selector).first();
+
+    if (element.length) {
+      const text = cleanText(element.html() || element.text());
+
+      if (text && text.length > 20) {
+        return text;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractFirstParagraph(text) {
+  if (!text) return null;
+
+  const cleaned = cleanText(text);
+
+  const blockedStarts = [
+    "News",
+    "Topics",
+    "Notices",
+    "Maintenance",
+    "Updates",
+    "Status",
+    "Patch Notes",
+    "Special Sites",
+    "The Lodestone",
+    "FINAL FANTASY XIV"
+  ];
+
+  const paragraphs = cleaned
+    .split(/\n{2,}|\n/)
+    .map(p => p.trim())
+    .filter(p => p.length >= 40)
+    .filter(p => !blockedStarts.some(start => p.startsWith(start)))
+    .filter(p => !p.includes("JavaScript"))
+    .filter(p => !p.includes("window."))
+    .filter(p => !p.includes("var "));
+
+  if (paragraphs.length === 0) {
+    return null;
+  }
+
+  return limitText(paragraphs[0], 900);
+}
+
+function extractDateTimeSection(text) {
+  if (!text) return null;
+
+  const cleaned = cleanText(text);
+  const marker = "[Date & Time]";
+  const startIndex = cleaned.indexOf(marker);
+
+  if (startIndex === -1) {
+    return null;
+  }
+
+  let afterMarker = cleaned.slice(startIndex + marker.length).trim();
+
+  const stopMarkers = [
+    "[Affected Service]",
+    "[Affected Worlds]",
+    "[Details]",
+    "[Update Details]",
+    "[Maintenance Details]",
+    "[Recovery Details]",
+    "[Issue Details]",
+    "[Cause]",
+    "[Countermeasures]",
+    "[In-game Content]",
+    "[Companion App]",
+    "[Known Issues]"
+  ];
+
+  let stopIndex = -1;
+
+  for (const stopMarker of stopMarkers) {
+    const index = afterMarker.indexOf(stopMarker);
+
+    if (index !== -1 && (stopIndex === -1 || index < stopIndex)) {
+      stopIndex = index;
+    }
+  }
+
+  if (stopIndex !== -1) {
+    afterMarker = afterMarker.slice(0, stopIndex).trim();
+  }
+
+  const monthRegex =
+    /\b(?:Jan\.?|January|Feb\.?|February|Mar\.?|March|Apr\.?|April|May|Jun\.?|June|Jul\.?|July|Aug\.?|August|Sep\.?|Sept\.?|September|Oct\.?|October|Nov\.?|November|Dec\.?|December)\b/i;
+
+  const yearRegex = /\b20\d{2}\b/;
+
+  const dateLines = afterMarker
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .filter(line => monthRegex.test(line) && yearRegex.test(line));
+
+  if (dateLines.length === 0) {
+    return null;
+  }
+
+  return limitText(dateLines.join("\n"), 1000);
+}
+
+async function fetchArticleDetails(articleUrl, categoryKey) {
   try {
     const html = await fetchHtml(articleUrl);
     const $ = cheerio.load(html);
 
-    const ogImage =
+    $("script").remove();
+    $("style").remove();
+    $("noscript").remove();
+
+    const metaTitle =
+      $("meta[property='og:title']").attr("content") ||
+      $("meta[name='twitter:title']").attr("content") ||
+      $("title").text();
+
+    const metaDescription =
+      $("meta[property='og:description']").attr("content") ||
+      $("meta[name='description']").attr("content") ||
+      $("meta[name='twitter:description']").attr("content");
+
+    const metaImage =
       $("meta[property='og:image']").attr("content") ||
       $("meta[name='twitter:image']").attr("content");
 
-    const firstImage =
+    const fallbackImage =
       $(".news__detail__wrapper img").first().attr("src") ||
       $(".news__detail img").first().attr("src") ||
       $(".topics__detail img").first().attr("src") ||
       $("article img").first().attr("src") ||
       $("main img").first().attr("src");
 
-    const ogDescription =
-      $("meta[property='og:description']").attr("content") ||
-      $("meta[name='description']").attr("content") ||
-      $("meta[name='twitter:description']").attr("content");
+    const title = cleanTitle(metaTitle);
 
-    let description = ogDescription ? cleanText(ogDescription) : null;
+    const baseDescription =
+      cleanLodestoneDescription(metaDescription) ||
+      "New Lodestone publication available.";
 
-    if (!description) {
-      description =
-        cleanText($(".news__detail__wrapper").first().text()) ||
-        cleanText($(".news__detail").first().text()) ||
-        cleanText($(".topics__detail").first().text()) ||
-        cleanText($("article").first().text()) ||
-        null;
+    const articleText = getArticleText($);
+
+    let finalDescription = baseDescription;
+    let dateTimeSection = null;
+
+    if (categoryKey === "topics" || categoryKey === "notices") {
+      const firstParagraph = extractFirstParagraph(articleText);
+
+      if (firstParagraph) {
+        finalDescription = firstParagraph;
+      }
     }
 
-    return {
-      image: ogImage
-        ? absoluteUrl(ogImage, articleUrl)
-        : firstImage
-          ? absoluteUrl(firstImage, articleUrl)
-          : null,
+    if (categoryKey === "maintenance" || categoryKey === "updates") {
+      dateTimeSection = extractDateTimeSection(articleText);
+    }
 
-      description: limitText(description, 500)
+    const image = metaImage
+      ? absoluteUrl(metaImage, articleUrl)
+      : fallbackImage
+        ? absoluteUrl(fallbackImage, articleUrl)
+        : null;
+
+    return {
+      title,
+      description: finalDescription,
+      image,
+      dateTimeSection
     };
   } catch (error) {
     console.error(`Unable to fetch article details: ${articleUrl}`);
     return {
+      title: null,
+      description: "New Lodestone publication available.",
       image: null,
-      description: null
+      dateTimeSection: null
     };
   }
 }
@@ -178,7 +377,7 @@ async function fetchCategoryNews(category) {
   $("a").each((_, element) => {
     const link = $(element);
     const href = link.attr("href");
-    const title = cleanText(link.text());
+    const title = cleanTitle(link.text());
 
     if (!href || !title) return;
 
@@ -202,7 +401,6 @@ async function fetchCategoryNews(category) {
       title,
       url: fullUrl,
       image: listImage ? absoluteUrl(listImage, category.url) : null,
-      description: null,
       categoryKey: category.key,
       categoryLabel: category.label,
       color: category.color,
@@ -225,23 +423,20 @@ async function postNews(item, channelId) {
     return;
   }
 
-  const details = await fetchArticleDetails(item.url);
+  const details = await fetchArticleDetails(item.url, item.categoryKey);
 
-  if (!item.image && details.image) {
-    item.image = details.image;
-  }
-
-  if (!item.description && details.description) {
-    item.description = details.description;
-  }
+  const finalTitle = details.title || item.title;
+  const finalDescription =
+    details.description || "New Lodestone publication available.";
+  const finalImage = details.image || item.image;
 
   const embed = new EmbedBuilder()
     .setAuthor({
       name: `The Lodestone - ${item.categoryLabel}`
     })
-    .setTitle(`${item.emoji} ${item.title}`)
+    .setTitle(`${item.emoji} ${cleanTitle(finalTitle)}`)
     .setURL(item.url)
-    .setDescription(item.description || "New Lodestone publication available.")
+    .setDescription(finalDescription)
     .addFields({
       name: "Link",
       value: `[Open the article on The Lodestone](${item.url})`
@@ -252,8 +447,15 @@ async function postNews(item, channelId) {
     })
     .setTimestamp(new Date());
 
-  if (item.image) {
-    embed.setImage(item.image);
+  if (details.dateTimeSection) {
+    embed.addFields({
+      name: "[Date & Time]",
+      value: details.dateTimeSection
+    });
+  }
+
+  if (finalImage) {
+    embed.setImage(finalImage);
   }
 
   await channel.send({ embeds: [embed] });
